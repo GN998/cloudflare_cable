@@ -1,4 +1,4 @@
-name = "cloudflare_caBLE"
+name = "cloudflare_cable"
 main = "src/index.ts"
 # Must be >= 2026-02-24 so that calling deleteAll() cleans up underlying Alarms automatically
 compatibility_date = "2026-05-26"
