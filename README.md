@@ -45,4 +45,6 @@ This project is made possible thanks to the incredible infrastructure and open s
 * **[Cloudflare](https://www.cloudflare.com/)**: For providing the blazing-fast edge network, Workers, and Durable Objects infrastructure that powers this serverless tunnel.
 * **[FIDO Alliance](https://fidoalliance.org/)**: For developing and maintaining the open FIDO2/WebAuthn and caBLE protocol specifications that secure the modern web.
 
+---
 
+Thanks to [GitHub](https://github.com/) and [Linux do](https://linux.do/).
