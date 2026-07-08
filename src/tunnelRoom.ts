@@ -38,15 +38,15 @@ export class TunnelRoom extends DurableObject<Env> {
         const isCustom = url.pathname.startsWith("/cable/custom/");
 
         // 2. Inspect tunnel lifecycle status (Tombstone mechanism)
-        if (await this.ctx.storage.get(DO_STATE_KEYS.TOMBSTONED)) {
+        // Use Synchronous KV API with boolean coercion to prevent undefined issues
+        if (!!this.ctx.storage.kv.get(DO_STATE_KEYS.TOMBSTONED)) {
             return createError("Gone: Tunnel is exhausted and permanently sealed", 410);
         }
 
         // 3. Record Contact status
         if (isContact) {
-            // Optimization: Utilizes 'allowUnconfirmed: true'
-            // Allows the HTTP 101 WebSocket response to fire instantly without waiting for disk serialization (avoids Output Gate blockage), minimizing handshake latency.
-            this.ctx.storage.put(DO_STATE_KEYS.IS_CONTACT, true, { allowUnconfirmed: true }).catch(() => {});
+            // Replace async put with Synchronous KV API to eliminate await and catch
+            this.ctx.storage.kv.put(DO_STATE_KEYS.IS_CONTACT, true);
         }
 
         // Core Mechanic: Exclusive eviction for identical roles & capacity restrictions
@@ -75,8 +75,8 @@ export class TunnelRoom extends DurableObject<Env> {
         const targetRole: Role = role === "client" ? "authenticator" : "client";
         const peerSockets = this.ctx.getWebSockets(targetRole);
         if (peerSockets.length > 0) {
-            // Optimization: Use 'allowUnconfirmed: true' to prevent Output Gate blocks
-            await this.ctx.storage.put(DO_STATE_KEYS.HAS_PAIRED, true, { allowUnconfirmed: true });
+            // Replace async put with Synchronous KV API
+            this.ctx.storage.kv.put(DO_STATE_KEYS.HAS_PAIRED, true);
         }
 
         // Core Mechanic: Transactional offset for offline messages (Read-and-Destroy)
@@ -96,7 +96,8 @@ export class TunnelRoom extends DurableObject<Env> {
             
             // Once securely pulled into memory, wipe them out within the same physical transaction
             if (msgs.length > 0) {
-                this.ctx.storage.sql.exec(`DELETE FROM msg_buffer`);
+                // Delete only the messages sent by the peer to prevent wiping out unread messages sent by myself
+                this.ctx.storage.sql.exec(`DELETE FROM msg_buffer WHERE sender_role != ?`, role);
             }
             
             return msgs;
@@ -200,14 +201,15 @@ export class TunnelRoom extends DurableObject<Env> {
         }
 
         // Schedule lifecycles via Alarms TTL
-        const isContact = await this.ctx.storage.get(DO_STATE_KEYS.IS_CONTACT);
-        const hasPaired = await this.ctx.storage.get(DO_STATE_KEYS.HAS_PAIRED);
-        const tombstoned = await this.ctx.storage.get(DO_STATE_KEYS.TOMBSTONED);
+        // Use Synchronous KV API with boolean coercion to prevent undefined issues
+        const isContact = !!this.ctx.storage.kv.get(DO_STATE_KEYS.IS_CONTACT);
+        const hasPaired = !!this.ctx.storage.kv.get(DO_STATE_KEYS.HAS_PAIRED);
+        const tombstoned = !!this.ctx.storage.kv.get(DO_STATE_KEYS.TOMBSTONED);
         
         if (!isContact && hasPaired && !tombstoned) {
             // Ephemeral session already paired: Mark as dead, queue physical purge in 1 minute
-            // Optimization: Incorporates 'allowUnconfirmed: true' to avoid blocking the closing handshake response gate
-            await this.ctx.storage.put(DO_STATE_KEYS.TOMBSTONED, true, { allowUnconfirmed: true });
+            // Replace async put with Synchronous KV API
+            this.ctx.storage.kv.put(DO_STATE_KEYS.TOMBSTONED, true);
             await this.ctx.storage.setAlarm(Date.now() + 60 * 1000); 
         } else if (isContact) {
             // Persistent contact: Silently extend lease for 30 days
