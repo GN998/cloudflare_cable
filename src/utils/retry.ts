@@ -1,8 +1,8 @@
 // src/utils/retry.ts
 import { DOError } from "../types";
 
-const MAX_RETRIES = 3;
-const INITIAL_BACKOFF_MS = 100;
+const MAX_RETRIES = 2;
+const INITIAL_BACKOFF_MS = 20;
 
 /**
  * Asynchronous operation wrapper equipped with an Exponential Backoff algorithm.
@@ -33,7 +33,7 @@ export async function withExponentialBackoff<T>(
 
             retries++;
             
-            // Exponential Backoff: 100ms -> 200ms -> 400ms
+            // Exponential Backoff: 20ms -> 40ms
             const backoff = INITIAL_BACKOFF_MS * Math.pow(2, retries - 1);
             // Add jitter (0~50ms) to randomize retry traffic and prevent the thundering herd problem.
             const jitter = Math.random() * 50;
