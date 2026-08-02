@@ -30,9 +30,7 @@ Simply modify the code and deploy it yourself. In Cloudflare Workers & Pages, se
 
 ```toml
 routes = [
-  { pattern = "cable.yourdomain.com/cable/custom/*", zone_name = "yourdomain.com" },
-  { pattern = "cable.yourdomain.com/cable/connect/*", zone_name = "yourdomain.com" },
-  { pattern = "cable.yourdomain.com/cable/contact/*", zone_name = "yourdomain.com" } 
+  { pattern = "cable.yourdomain.com", custom_domain = true } 
 ]
 
 ```

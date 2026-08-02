@@ -4,9 +4,7 @@ main = "src/index.ts"
 compatibility_date = "2026-05-26"
 
 routes = [
-  { pattern = "cable.yourdomain.com/cable/custom/*", zone_name = "yourdomain.com" },
-  { pattern = "cable.yourdomain.com/cable/connect/*", zone_name = "yourdomain.com" },
-  { pattern = "cable.yourdomain.com/cable/contact/*", zone_name = "yourdomain.com" } 
+  { pattern = "cable.yourdomain.com", custom_domain = true } 
 ]
 
 [[durable_objects.bindings]]
