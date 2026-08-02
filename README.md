@@ -14,9 +14,9 @@ A super simple, ultra-lightweight FIDO caBLE tunnel server running entirely on C
 
 ## ⚠️ Compliance and Disclaimer
 
-This project is intended solely for academic research and technical exchange regarding FIDO/WebAuthn cryptographic protocols, demonstrating the implementation principles of caBLE.
+The code is provided 'as is', and the developers assume no liability for any misuse, damages, or legal consequences arising from its deployment.
 
-This project does not provide any public relay services. The developers assume no responsibility or liability for any legal consequences arising from the deployment of services using this code by any individual or organization.
+This project is intended solely for academic research and technical exchange regarding FIDO/WebAuthn cryptographic protocols, demonstrating the implementation principles of caBLE.
 
 Users must use this project in strict compliance with local laws and regulations. It is strictly prohibited to modify or use this code for any form of illegal activity.
 
