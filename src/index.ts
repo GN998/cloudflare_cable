@@ -36,8 +36,9 @@ export default {
         }
 
         // Security Enforcement: Pursuant to CTAP 2.3 spec, enforce front-end Hex encoding validations on Client Payloads
+        // Restrict maximum length to 64 bytes to prevent DoS attacks
         const clientPayload = request.headers.get("X-caBLE-Client-Payload");
-        if (clientPayload && !/^[a-f0-9]+$/i.test(clientPayload)) {
+        if (clientPayload !== null && !/^(?:[a-f0-9]{2}){1,64}$/i.test(clientPayload)) {
             return createError("Bad Request: Invalid Client Payload encoding", 400);
         }
 
