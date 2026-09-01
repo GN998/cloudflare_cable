@@ -140,7 +140,7 @@ export class TunnelRoom extends DurableObject<Env> {
             return;
         }
 
-        // Defensive Interception 2: CTAP2.3 Spec 11.5.1.1.1 declares empty messages as explicit protocol violations
+        // Defensive Interception 2: CTAP 2.3 Spec Section 11.5.1.2 declares empty messages as explicit protocol violations
         if (message.byteLength === 0) {
             ws.close(1002, "Protocol Error: Empty message is not allowed in caBLE");
             return;
