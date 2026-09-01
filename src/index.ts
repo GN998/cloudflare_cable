@@ -35,8 +35,10 @@ export default {
             return createError("Forbidden: Invalid WebSocket Protocol", 403);
         }
 
-        // Security Enforcement: Pursuant to CTAP 2.3 spec, enforce front-end Hex encoding validations on Client Payloads
-        // Restrict maximum length to 64 bytes to prevent DoS attacks
+        // Protocol validation: Require X-caBLE-Client-Payload to be hex-encoded,
+        // as specified for state-assisted transactions in CTAP 2.3 11.5.2.
+        // Implementation-defined security limit: Accept at most 64 decoded bytes
+        // (128 hexadecimal characters) to reduce resource-exhaustion risk.
         const clientPayload = request.headers.get("X-caBLE-Client-Payload");
         if (clientPayload !== null && !/^(?:[a-f0-9]{2}){1,64}$/i.test(clientPayload)) {
             return createError("Bad Request: Invalid Client Payload encoding", 400);
@@ -89,8 +91,9 @@ export default {
             // Wrap the DO invocation with the exponential backoff utility.
             // Since GET requests contain no bodies, retrying avoids any "body already used" runtime TypeErrors.
             return await withExponentialBackoff(() => {
-                // Spec Correction: Re-acquire a completely fresh Stub instance on every attempt/retry
-                // to prevent reuse of corrupted/broken Stubs that have already thrown previous exceptions.
+                // Cloudflare Durable Objects error handling:
+                // Acquire a new stub for each attempt because certain exceptions may leave
+                // the previous stub in a broken state and cause subsequent calls to fail.
                 const stub = env.TUNNEL_ROOM.get(doId);
                 return stub.fetch(request);
             });

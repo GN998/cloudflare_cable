@@ -79,8 +79,9 @@ export class TunnelRoom extends DurableObject<Env> {
             this.ctx.storage.kv.put(DO_STATE_KEYS.HAS_PAIRED, true);
         }
 
-        // Core Mechanic: Transactional offset for offline messages (Read-and-Destroy)
-        // Spec Correction: Adhering strictly to the "synchronous-storage-only within transactions" rule, network I/O is segregated outside the transaction scope.
+        // Implementation strategy: Atomically read and delete buffered peer messages
+        // within transactionSync, then deliver them over WebSocket after the
+        // storage transaction completes.
         const messagesToDispatch = this.ctx.storage.transactionSync(() => {
             // Fetch offline messages emitted by the peer
             const cursor = this.ctx.storage.sql.exec(
@@ -103,7 +104,9 @@ export class TunnelRoom extends DurableObject<Env> {
             return msgs;
         });
 
-        // Broadcast network packets externally after a successful transaction commit (failures won't corrupt the DB state)
+        // Deliver buffered messages after the transaction commits.
+        // Delivery is best-effort: a send failure does not restore messages
+        // already removed from the persistent buffer.
         for (const msg of messagesToDispatch) {
             try {
                 server.send(msg);
@@ -143,10 +146,14 @@ export class TunnelRoom extends DurableObject<Env> {
             return;
         }
 
-        // Defensive Interception 3: CTAP2.3 Spec 12.4 grants Large Blob payload allocations.
-        // Cap raised to 1MiB (1048576) + padding/AEAD headroom = 1049600 bytes to prevent memory depletion attacks on the DO.
+        // Defensive Interception 3: Service-level DoS and memory-depletion protection.
+        // The illustrative implementation in CTAP 2.3 Section 11.5.1.2 rejects
+        // plaintext messages larger than 1 MiB (1,048,576 bytes).
+        // With the example's 32-byte padding granularity and a 16-byte AES-GCM tag,
+        // the resulting ciphertext can be up to 1,048,624 bytes.
+        // This service uses a conservative, implementation-defined limit of 1,049,600 bytes.
         if (message.byteLength > 1049600) {
-            ws.close(1009, "Message Too Big: Exceeds 1MiB limit");
+            ws.close(1009, "Message Too Big: Exceeds service-defined ciphertext limit");
             return;
         }
 
