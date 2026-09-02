@@ -19,41 +19,65 @@ export default {
             return createOptionsResponse();
         }
 
-        // 2. HTTP Method constraints: WebSocket handshakes must use GET
-        if (request.method !== "GET") {
-            return createError("Method Not Allowed", 405);
+        // 4. Routing & endpoint evaluation
+        const url = new URL(request.url);
+        const path = url.pathname;
+        
+        const isCustom = path.startsWith("/cable/new/");
+        const isConnect = path.startsWith("/cable/connect/");
+        const isContact = path.startsWith("/cable/contact/"); 
+        
+        // Add internal endpoints for contact registration and request acceptance
+        const isContactRegister = path.startsWith("/internal/contact/register/");
+        const isContactAccept = path.startsWith("/internal/contact/accept/");
+        // Evaluate the contact revoke endpoint
+        const isContactRevoke = path.startsWith("/internal/contact/revoke/");
+
+        if (!isCustom && !isConnect && !isContact && !isContactRegister && !isContactAccept && !isContactRevoke) {
+            return createError("Not Found: Invalid FIDO endpoint", 404);
         }
 
-        // 3. Strict protocol compliance verification
-        const upgradeHeader = request.headers.get("Upgrade") || "";
-        if (upgradeHeader.toLowerCase() !== "websocket") {
-            return createError("Expected Upgrade: websocket", 426);
+        // 2 & 3. HTTP Method & WebSocket constraints
+        if (isContactRevoke) {
+            // Revoke is a state modification operation, enforce POST without WebSocket handshake
+            if (request.method !== "POST") {
+                return createError("Method Not Allowed: Expected POST for revoke", 405);
+            }
+        } else {
+            // 2. HTTP Method constraints: WebSocket handshakes must use GET
+            if (request.method !== "GET") {
+                return createError("Method Not Allowed", 405);
+            }
+
+            // 3. Strict protocol compliance verification
+            const upgradeHeader = request.headers.get("Upgrade") || "";
+            if (upgradeHeader.toLowerCase() !== "websocket") {
+                return createError("Expected Upgrade: websocket", 426);
+            }
+
+            // Parse and validate the Subprotocol with exact token matching instead of a loose substring search
+            const rawProtocols = request.headers.get("Sec-WebSocket-Protocol") || "";
+            const protocolTokens = rawProtocols.split(",").map(s => s.trim()).filter(Boolean);
+            const expectedProtocol = isContactRegister ? "fido.cable.contact" : "fido.cable";
+            if (!protocolTokens.includes(expectedProtocol)) {
+                return createError("Forbidden: Invalid WebSocket Protocol", 403);
+            }
         }
 
-        const protocols = request.headers.get("Sec-WebSocket-Protocol") || "";
-        if (!protocols.includes("fido.cable")) {
-            return createError("Forbidden: Invalid WebSocket Protocol", 403);
-        }
-
-        // Protocol validation: Require X-caBLE-Client-Payload to be hex-encoded,
-        // as specified for state-assisted transactions in CTAP 2.3 11.5.2.
-        // Implementation-defined security limit: Accept at most 64 decoded bytes
-        // (128 hexadecimal characters) to reduce resource-exhaustion risk.
+        // CTAP 2.3 §11.5.2 requires X-caBLE-Client-Payload to be hex-encoded.
+        // The maximum accepted length below is an implementation-defined resource-protection limit and is not mandated by CTAP.
         const clientPayload = request.headers.get("X-caBLE-Client-Payload");
         if (clientPayload !== null && !/^(?:[a-f0-9]{2}){1,64}$/i.test(clientPayload)) {
             return createError("Bad Request: Invalid Client Payload encoding", 400);
         }
 
-        // 4. Routing & endpoint evaluation
-        const url = new URL(request.url);
-        const path = url.pathname;
-        
-        const isCustom = path.startsWith("/cable/custom/");
-        const isConnect = path.startsWith("/cable/connect/");
-        const isContact = path.startsWith("/cable/contact/"); 
-
-        if (!isCustom && !isConnect && !isContact) {
-            return createError("Not Found: Invalid FIDO endpoint", 404);
+        // Enforce global service-level authentication only on registration endpoint.
+        // Accept endpoints are authenticated inside DO using derived capability and acceptToken.
+        if (isContactRegister) {
+            const authHeader = request.headers.get("Authorization");
+            if (authHeader !== `Bearer ${env.CONTACT_INTERNAL_TOKEN}`) {
+                return createError("Unauthorized: Invalid internal token", 401);
+            }
         }
 
         const parts = path.split("/").filter(Boolean);
@@ -66,36 +90,66 @@ export default {
         if (isConnect) {
             if (parts.length !== 4) return createError("Bad Request: Malformed connect URL", 400);
             
-            // Security Enforcement: Pursuant to CTAP 2.3 spec, enforce 24-bit (6-char) lowercase Hex formatting on Routing IDs
+            // CTAP 2.3 represents the 24-bit routing ID in the URL as 6 lowercase hexadecimal characters.
             const routingId = parts[2];
             if (!/^[a-f0-9]{6}$/.test(routingId)) {
                 return createError("Bad Request: Invalid Routing ID format", 400);
             }
             
             identifier = parts[3]; 
+        } else if (isContactAccept) {
+            // Handle internal accept path containing both contactID and requestID
+            if (parts.length !== 5) return createError("Bad Request: Malformed accept URL", 400);
+            identifier = parts[3];
+        } else if (isContactRegister) {
+            // Handle internal register path containing contactID
+            if (parts.length !== 4) return createError("Bad Request: Malformed register URL", 400);
+            identifier = parts[3];
+        } else if (isContactRevoke) {
+            // Extract the identifier securely for the revoke action
+            if (parts.length !== 4) return createError("Bad Request: Malformed revoke URL", 400);
+            identifier = parts[3];
+        } else if (isCustom || isContact) {
+            // Strictly enforce exactly 3 segments for custom and contact paths to prevent malformed URL handling
+            if (parts.length !== 3) return createError("Bad Request: Malformed URL", 400);
+            identifier = parts[2];
         } else {
             identifier = parts[parts.length - 1];
         }
 
+        // Define a boolean flag representing any contact-related flow
+        const isContactFlow = isContact || isContactRegister || isContactAccept || isContactRevoke;
+
         // 5. Structural identifier checks (defends against path traversal and malicious script injections)
-        if (!validateIdentifier(identifier, isContact)) {
+        if (!validateIdentifier(identifier, isContactFlow)) {
             return createError("Bad Request: Invalid Identifier format", 400);
         }
 
         // 6. Routing Strategy: Generate a unique namespace key to map out the corresponding DO instances
-        const namespaceKey = isContact ? `contact:${identifier}` : `tunnel:${identifier}`;
+        const namespaceKey = isContactFlow ? `contact:${identifier}` : `tunnel:${identifier}`;
         const doId = env.TUNNEL_ROOM.idFromName(namespaceKey);
 
         // 7. Intelligent Retry & Request Forwarding
         try {
-            // Wrap the DO invocation with the exponential backoff utility.
-            // Since GET requests contain no bodies, retrying avoids any "body already used" runtime TypeErrors.
+            const isWebSocketUpgrade = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+
+            if (isWebSocketUpgrade) {
+                // Disable automatic retries for WebSocket handshakes to prevent non-idempotent 409 Conflicts.
+                // If the DO successfully registers the socket but the response drops, a gateway retry would falsely trigger a 409.
+                const stub = env.TUNNEL_ROOM.get(doId);
+                return await stub.fetch(request);
+            }
+
+            // Wrap the DO invocation with the exponential backoff utility for stateless operations.
+            // Clone the request before fetching to ensure the body stream is not consumed, 
+            // preventing "TypeError: body already used" during POST retries.
             return await withExponentialBackoff(() => {
                 // Cloudflare Durable Objects error handling:
                 // Acquire a new stub for each attempt because certain exceptions may leave
                 // the previous stub in a broken state and cause subsequent calls to fail.
                 const stub = env.TUNNEL_ROOM.get(doId);
-                return stub.fetch(request);
+                // Clone the request to prevent "TypeError: body already used" during retries for POST requests like revoke
+                return stub.fetch(request.clone());
             });
         } catch (error) {
             console.error(`Gateway failed to forward request to DO [${namespaceKey}]:`, error);
