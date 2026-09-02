@@ -1,190 +1,220 @@
 // src/tunnelRoom.ts
 import { DurableObject } from "cloudflare:workers";
-import { Env, Role, DO_STATE_KEYS } from "./types";
-import { inferRole, generateRoutingId } from "./utils/fido";
+import { Env, Role, DO_STATE_KEYS, DB_CONFIG } from "./types";
+import { BufferStore } from "./db/bufferStore";
+import { inferRole, validateFrame, generateRoutingId } from "./utils/fido";
 import { createError } from "./utils/response";
 
 /**
- * FIDO caBLE Tunnel Core Room Class (Durable Object)
- * Responsible for WebSocket interception, state synchronization, lock-free buffering, and lifecycle scheduling.
+ * FIDO caBLE Tunnel Core Room Class (Durable Object) - v4.3 (Fixed)
+ * Standard-compliant PASSKEY tunnel with hibernation support and offline SQLite buffering.
  */
 export class TunnelRoom extends DurableObject<Env> {
+    private db: BufferStore;
+
+    /**
+     * Cache persistent state flags in memory to prevent redundant billed storage reads within the same isolate lifecycle.
+     */
+    private isTombstonedCache: boolean | null = null;
+    private isContactCache: boolean | null = null;
+    private clientPayloadCache: string | null = null;
+
     constructor(ctx: DurableObjectState, env: Env) {
         super(ctx, env);
         
-        // Lock-free synchronous table creation:
-        // DO storage operations are single-threaded and synchronous. We initialize schemas right inside the constructor.
-        // Spec Correction: Adhering strictly to official guidelines, blockConcurrencyWhile is used to block incoming 
-        // concurrent requests, ensuring the underlying Schema is fully initialized before routing any network traffic or events.
+        // Instantiate the built-in SQLite data access layer
+        this.db = new BufferStore(this.ctx.storage.sql);
+
+        // Use blockConcurrencyWhile for asynchronous schema initialization, blocking concurrent requests.
         this.ctx.blockConcurrencyWhile(async () => {
-            this.ctx.storage.sql.exec(`
-                CREATE TABLE IF NOT EXISTS msg_buffer (
-                    id INTEGER PRIMARY KEY, 
-                    sender_role TEXT, 
-                    data BLOB, 
-                    created_at INTEGER
-                )
-            `);
+            try {
+                this.db.initSchema();
+            } catch (error) {
+                console.error("[caBLE] Failed to initialize SQLite database:", error);
+            }
         });
     }
 
     async fetch(request: Request): Promise<Response> {
         const url = new URL(request.url);
+        const path = url.pathname;
         
-        // 1. Extract context and infer the operational role
-        const hasClientPayload = request.headers.has("X-caBLE-Client-Payload");
-        const role = inferRole(url.pathname, hasClientPayload);
-        const isContact = url.pathname.startsWith("/cable/contact/");
-        const isCustom = url.pathname.startsWith("/cable/custom/");
-
-        // 2. Inspect tunnel lifecycle status (Tombstone mechanism)
-        // Use Synchronous KV API with boolean coercion to prevent undefined issues
-        if (!!this.ctx.storage.kv.get(DO_STATE_KEYS.TOMBSTONED)) {
+        // 1. Return 410 Gone if tombstoned to prevent session reuse and replay attacks.
+        if (this.isTombstonedCache === null) {
+            this.isTombstonedCache = !!(await this.ctx.storage.get(DO_STATE_KEYS.TOMBSTONED));
+        }
+        if (this.isTombstonedCache) {
             return createError("Gone: Tunnel is exhausted and permanently sealed", 410);
         }
 
-        // 3. Record Contact status
-        if (isContact) {
-            // Replace async put with Synchronous KV API to eliminate await and catch
-            this.ctx.storage.kv.put(DO_STATE_KEYS.IS_CONTACT, true);
+        const isContact = path.startsWith("/cable/contact/");
+        const isNew = path.startsWith("/cable/new/");
+
+        // 2. Persist state indicating a state-assisted link transaction only once per room lifecycle.
+        if (isContact && !this.isContactCache) {
+            await this.ctx.storage.put(DO_STATE_KEYS.IS_CONTACT, true);
+        }
+        this.isContactCache = isContact;
+
+        // 3. Extract client payload and check active sockets to initialize fresh session state.
+        const clientPayload = request.headers.get("X-caBLE-Client-Payload");
+        const hasClientPayload = clientPayload !== null;
+
+        // Persist X-caBLE-Client-Payload when the client initiates a state-assisted transaction so the authenticator can retrieve it upon connecting.
+        if (isContact && hasClientPayload) {
+            const normalizedPayload = clientPayload.toLowerCase();
+            const activeAuthSockets = this.ctx.getWebSockets("authenticator").filter(s => s.readyState === 1);
+            // Purge unconsumed frames from aborted prior transactions to prevent Noise NKpsk0 handshake corruption.
+            if (this.clientPayloadCache !== normalizedPayload && activeAuthSockets.length === 0) {
+                this.db.clearAll();
+            }
+            this.clientPayloadCache = normalizedPayload;
+            await this.ctx.storage.put(DO_STATE_KEYS.CLIENT_PAYLOAD, normalizedPayload);
         }
 
-        // Core Mechanic: Exclusive eviction for identical roles & capacity restrictions
-        // Filter and retrieve WebSockets directly via 'Role' tags at the framework layer, eliminating complex in-memory Maps.
-        const existingSameRoleSockets = this.ctx.getWebSockets(role);
+        // Mark buffer empty only when the first peer arrives in a fresh session with no pending alarm.
+        const pendingAlarm = await this.ctx.storage.getAlarm();
+        const hasActivePeers = this.ctx.getWebSockets().some(s => s.readyState === 1);
+        if (!hasActivePeers && pendingAlarm === null) {
+            this.db.markEmpty();
+        }
+
+        // Resolve participant role directly from endpoint semantics to support non-browser native clients.
+        const role = inferRole(path, hasClientPayload);
+
+        // 4. Close any stale connection of the same role and inherit its frame counter to prevent reconnect quota bypass.
+        const existingSameRoleSockets = this.ctx.getWebSockets(role).filter(s => s.readyState === 1);
+        let inheritedFrames = 0;
         for (const sock of existingSameRoleSockets) {
+            const prevAttachment = sock.deserializeAttachment() as { relayedFrames?: number } | null;
+            if (prevAttachment?.relayedFrames && prevAttachment.relayedFrames > inheritedFrames) {
+                inheritedFrames = prevAttachment.relayedFrames;
+            }
             try { 
-                sock.close(1000, "Replaced by new connection"); 
-            } catch (e) { /* Ignore errors from stale connections */ }
+                sock.close(1000, "Replaced by new connection session"); 
+            } catch (e) {}
         }
 
-        const allSockets = this.ctx.getWebSockets();
-        if (allSockets.length >= 2 && existingSameRoleSockets.length === 0) {
+        // Enforce maximum capacity of 2 active peers per tunnel.
+        const updatedSockets = this.ctx.getWebSockets().filter(s => s.readyState === 1);
+        if (updatedSockets.length >= 2 && existingSameRoleSockets.length === 0) {
             return createError("Forbidden: Room is full", 403);
         }
 
-        // 4. Initialize and intercept the WebSocket handshake
+        // 5. Perform WebSocket handshake and upgrade.
         const pair = new WebSocketPair();
         const [client, server] = Object.values(pair);
 
-        // Core Mechanic: Lightweight containment based on Tags
-        // Attach the role string as a tag onto the WebSocket, allowing immediate identification upon hibernation wakeups.
+        // Accept WebSocket with the role tag for hibernation state recovery.
         this.ctx.acceptWebSocket(server, [role]);
 
-        // 5. Update pairing status
-        const targetRole: Role = role === "client" ? "authenticator" : "client";
-        const peerSockets = this.ctx.getWebSockets(targetRole);
-        if (peerSockets.length > 0) {
-            // Replace async put with Synchronous KV API
-            this.ctx.storage.kv.put(DO_STATE_KEYS.HAS_PAIRED, true);
+        // Attach frame counter to the WebSocket to survive Durable Object hibernation without billed storage writes.
+        server.serializeAttachment({ relayedFrames: inheritedFrames });
+
+        // Schedule or extend absolute session TTL alarm to guarantee cleanup of orphaned or stalled rooms.
+        await this.ctx.storage.setAlarm(Date.now() + DB_CONFIG.SESSION_TTL_MS);
+
+        // 6. Retrieve and dispatch offline buffered messages.
+        try {
+            const messagesToDispatch = this.db.consumeMessages(role);
+            for (const msg of messagesToDispatch) {
+                try {
+                    server.send(msg);
+                } catch (e) {
+                    console.error("Failed to deliver recovered buffer message to reconnected peer", e);
+                }
+            }
+        } catch (error) {
+            console.error("Failed to consume offline buffered messages:", error);
         }
 
-        // Implementation strategy: Atomically read and delete buffered peer messages
-        // within transactionSync, then deliver them over WebSocket after the
-        // storage transaction completes.
-        const messagesToDispatch = this.ctx.storage.transactionSync(() => {
-            // Fetch offline messages emitted by the peer
-            const cursor = this.ctx.storage.sql.exec(
-                `SELECT data FROM msg_buffer WHERE sender_role != ? ORDER BY created_at ASC`,
-                role
-            );
-            
-            const msgs: ArrayBuffer[] = [];
-            for (const row of cursor) {
-                // SQLite BLOB is streamed directly into an ArrayBuffer, incurring zero serialization overhead
-                msgs.push(row.data as ArrayBuffer);
-            }
-            
-            // Once securely pulled into memory, wipe them out within the same physical transaction
-            if (msgs.length > 0) {
-                // Delete only the messages sent by the peer to prevent wiping out unread messages sent by myself
-                this.ctx.storage.sql.exec(`DELETE FROM msg_buffer WHERE sender_role != ?`, role);
-            }
-            
-            return msgs;
-        });
-
-        // Deliver buffered messages after the transaction commits.
-        // Delivery is best-effort: a send failure does not restore messages
-        // already removed from the persistent buffer.
-        for (const msg of messagesToDispatch) {
-            try {
-                server.send(msg);
-            } catch (e) {
-                console.warn("Buffered message dispatch failed", e);
-            }
-        }
-
-        // 6. Assemble protocol response headers
+        // 7. Construct compliant response headers.
         const headers = new Headers();
-        const requestedProtocols = request.headers.get("Sec-WebSocket-Protocol") || "";
-        if (requestedProtocols.includes("fido.cable")) {
-            headers.set("Sec-WebSocket-Protocol", "fido.cable"); 
+        headers.set("Sec-WebSocket-Protocol", "fido.cable");
+        
+        if (isNew) {
+            headers.set("X-Cable-Routing-Id", generateRoutingId());
         }
 
-        // If it is a newly customized creation request, supply a Routing ID to formulate the QR code
-        if (isCustom) {
-            headers.set("X-Cable-Routing-Id", generateRoutingId());
+        // Forward the client payload header to the mobile authenticator on state-assisted transactions so it can derive the BLE EID key and Noise PSK.
+        if (isContact && role === "authenticator") {
+            if (this.clientPayloadCache === null) {
+                this.clientPayloadCache = (await this.ctx.storage.get<string>(DO_STATE_KEYS.CLIENT_PAYLOAD)) ?? null;
+            }
+            if (this.clientPayloadCache) {
+                headers.set("X-caBLE-Client-Payload", this.clientPayloadCache);
+            }
         }
 
         return new Response(null, { status: 101, webSocket: client, headers });
     }
 
     /**
-     * [Hibernation API] Processes incoming WebSocket messages
+     * [Hibernation API] Handle incoming WebSocket message frames.
      */
     async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string) {
-        // Defensive Interception 1: CTAP2.3 Spec dictates only binary frames are valid
-        if (typeof message === "string") {
-            ws.close(1003, "Unsupported Data: FIDO caBLE requires binary frames");
+        const check = validateFrame(message);
+        if (!check.valid) {
+            ws.close(check.code!, check.reason);
             return;
         }
 
-        // Defensive Interception 2: CTAP 2.3 Spec Section 11.5.1.2 declares empty messages as explicit protocol violations
-        if (message.byteLength === 0) {
-            ws.close(1002, "Protocol Error: Empty message is not allowed in caBLE");
+        // Persist frame count in WebSocket attachment so hibernation eviction cannot reset the rate limit and contact rooms isolate counts per connection.
+        const attachment = (ws.deserializeAttachment() as { relayedFrames?: number } | null) ?? { relayedFrames: 0 };
+        const currentFrames = (attachment.relayedFrames ?? 0) + 1;
+        if (currentFrames > DB_CONFIG.MAX_RELAYED_FRAMES) {
+            ws.close(1008, "Policy Violation: Maximum session frame limit exceeded");
             return;
         }
+        ws.serializeAttachment({ relayedFrames: currentFrames });
 
-        // Defensive Interception 3: Service-level DoS and memory-depletion protection.
-        // The illustrative implementation in CTAP 2.3 Section 11.5.1.2 rejects
-        // plaintext messages larger than 1 MiB (1,048,576 bytes).
-        // With the example's 32-byte padding granularity and a 16-byte AES-GCM tag,
-        // the resulting ciphertext can be up to 1,048,624 bytes.
-        // This service uses a conservative, implementation-defined limit of 1,049,600 bytes.
-        if (message.byteLength > 1049600) {
-            ws.close(1009, "Message Too Big: Exceeds service-defined ciphertext limit");
-            return;
-        }
-
-        // Rapidly restore role context via tags
-        const myRole = this.ctx.getTags(ws)[0] as Role;
+        const tags = this.ctx.getTags(ws);
+        const myRole = (tags && tags.length > 0 ? tags[0] : "client") as Role; // Retrieve role from socket tags.
         const targetRole: Role = myRole === "client" ? "authenticator" : "client";
-        const peerSockets = this.ctx.getWebSockets(targetRole);
+        
+        const peerSockets = this.ctx.getWebSockets(targetRole).filter(s => s.readyState === 1);
 
-        // Core Mechanic: Ultra-fast relaying vs lock-free buffering
         if (peerSockets.length > 0) {
-            // Peer is online: direct memory pass-through bypassing storage for zero latency
             for (const peer of peerSockets) {
-                try { peer.send(message); } catch (e) {}
+                try { 
+                    peer.send(message); 
+                } catch (e) {
+                    console.error("Relay fail, buffered locally instead", e);
+                    try {
+                        this.db.saveMessage(myRole, message as ArrayBuffer);
+                    } catch (dbError) {
+                        this.handleBufferError(ws, dbError);
+                    }
+                }
             }
         } else {
-            // Peer is offline: synchronous buffer flush to disk
-            // Threshold protection (max 10 items) to prevent malicious SQLite storage flooding
-            const countRow = this.ctx.storage.sql.exec(`SELECT count(*) as count FROM msg_buffer`).one();
-            if ((countRow as any).count < 10) { 
-                this.ctx.storage.sql.exec(
-                    `INSERT INTO msg_buffer (sender_role, data, created_at) VALUES (?, ?, ?)`, 
-                    myRole, message, Date.now()
-                );
-            } else {
-                ws.close(1009, "Message Too Big: Buffer overflow before peer connected");
+            try {
+                this.db.saveMessage(myRole, message as ArrayBuffer);
+            } catch (dbError) {
+                this.handleBufferError(ws, dbError);
             }
         }
     }
 
+    private handleBufferError(ws: WebSocket, error: unknown) {
+        const reason = error instanceof Error ? error.message : "Unknown buffer failure";
+        if (reason.includes("Buffer overflow")) {
+            ws.close(1009, "Offline buffer capacity exceeded");
+        } else {
+            console.error("[caBLE] Offline buffer storage failure:", error);
+            ws.close(1011, "Internal offline buffer failure");
+        }
+    }
+
     async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+        // Process disconnect routing before completing the close handshake so socket tags remain accessible.
         await this.handleDisconnect(ws);
+
+        // Complete the WebSocket closing handshake using a valid status code to prevent hanging TCP connections.
+        const safeCode = (code >= 1000 && code <= 4999 && code !== 1005 && code !== 1006) ? code : 1000;
+        try {
+            ws.close(safeCode, reason || "Connection closed");
+        } catch (e) {}
     }
 
     async webSocketError(ws: WebSocket, error: unknown) {
@@ -192,53 +222,89 @@ export class TunnelRoom extends DurableObject<Env> {
     }
 
     /**
-     * Core Mechanic: Full-duplex cascading termination & lifecycle orchestration
+     * Schedule reconnect grace period or immediate teardown without persisting redundant state keys.
      */
     private async handleDisconnect(ws: WebSocket) {
+        // Short-circuit if the room is already tombstoned in memory.
+        if (this.isTombstonedCache) return;
+
         const tags = this.ctx.getTags(ws);
-        if (tags.length === 0) return; // Already processed/cleaned up
+        if (!tags || tags.length === 0) return;
 
-        const myRole = tags[0] as Role;
-        const targetRole: Role = myRole === "client" ? "authenticator" : "client";
+        // Ignore late close events from sockets evicted by sealTunnel() after the lifecycle alarm was already cleared.
+        const currentAlarm = await this.ctx.storage.getAlarm();
+        if (currentAlarm === null) return;
 
-        // Cascading teardown: If one side of a FIDO tunnel drops, the whole session becomes obsolete
-        const peerSockets = this.ctx.getWebSockets(targetRole);
-        for (const peer of peerSockets) {
-            try { peer.close(1001, "Peer disconnected"); } catch (e) {}
+        const myRole = tags[0] as Role; // Safe index of the first tag element.
+        
+        const activeSameRoleSockets = this.ctx.getWebSockets(myRole).filter(s => s !== ws && s.readyState === 1);
+        if (activeSameRoleSockets.length > 0) {
+            console.log(`[caBLE] Old socket of role [${myRole}] closed after replacement. Keeping session active.`);
+            return;
         }
 
-        // Schedule lifecycles via Alarms TTL
-        // Use Synchronous KV API with boolean coercion to prevent undefined issues
-        const isContact = !!this.ctx.storage.kv.get(DO_STATE_KEYS.IS_CONTACT);
-        const hasPaired = !!this.ctx.storage.kv.get(DO_STATE_KEYS.HAS_PAIRED);
-        const tombstoned = !!this.ctx.storage.kv.get(DO_STATE_KEYS.TOMBSTONED);
+        const targetRole: Role = myRole === "client" ? "authenticator" : "client";
+        const peerSockets = this.ctx.getWebSockets(targetRole).filter(s => s.readyState === 1);
         
-        if (!isContact && hasPaired && !tombstoned) {
-            // Ephemeral session already paired: Mark as dead, queue physical purge in 1 minute
-            // Replace async put with Synchronous KV API
-            this.ctx.storage.kv.put(DO_STATE_KEYS.TOMBSTONED, true);
-            await this.ctx.storage.setAlarm(Date.now() + 60 * 1000); 
-        } else if (isContact) {
-            // Persistent contact: Silently extend lease for 30 days
-            await this.ctx.storage.setAlarm(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        if (peerSockets.length > 0) {
+            // Use RECONNECT_GRACE_MS or default to 30s.
+            const configuredGrace = Number(this.env.RECONNECT_GRACE_MS ?? "30000");
+            const gracePeriodMs = Number.isFinite(configuredGrace) && configuredGrace >= 1000 ? configuredGrace : 30000;
+            
+            await this.ctx.storage.setAlarm(Date.now() + gracePeriodMs); 
+            console.log(`[caBLE] Peer [${myRole}] disconnected. Initiating ${gracePeriodMs / 1000}s reconnection grace period.`);
         } else {
-            // Not paired yet (peer hasn't joined), provide a 3-minute grace period
-            await this.ctx.storage.setAlarm(Date.now() + 3 * 60 * 1000);
+            // Both peers disconnected; schedule teardown in 1 second.
+            await this.ctx.storage.setAlarm(Date.now() + 1000);
+            console.log(`[caBLE] Both peers disconnected. Scheduling absolute teardown in 1s.`);
         }
     }
 
     /**
-     * Core Mechanic: Absolute Physical Destruction
-     * When the alarm fires, utilizing compatibility features >= 2026-02-24,
-     * deleteAll() clears SQLite tables, KV properties, and pending alarms atomically.
+     * Execute tunnel teardown when reconnect grace period, disconnect timer, or session TTL expires.
      */
     async alarm() {
-        const allSockets = this.ctx.getWebSockets();
-        for (const sock of allSockets) {
-            try { sock.close(1000, "Tunnel absolute TTL expired"); } catch (e) {}
+        console.log(`[caBLE] Lifecycle alarm triggered. Sealing tunnel room.`);
+        await this.sealTunnel();
+    }
+
+    /**
+     * Seal the tunnel room, close sockets, and persist tombstone state if applicable.
+     */
+    private async sealTunnel() {
+        // 1. Close all remaining sockets.
+        const survivingSockets = this.ctx.getWebSockets();
+        for (const sock of survivingSockets) {
+            try { 
+                sock.close(1001, "FIDO Connection Lifetime Expired / Timeout"); 
+            } catch (e) {}
         }
         
-        // Completely reclaim storage blocks and self-destruct
-        await this.ctx.storage.deleteAll();
+        if (this.isContactCache === null) {
+            this.isContactCache = !!(await this.ctx.storage.get(DO_STATE_KEYS.IS_CONTACT));
+        }
+
+        // 2. Clear SQL message buffer with error handling.
+        try {
+            this.db.clearAll();
+        } catch (error) {
+            console.error("[caBLE] SQLite cleanup failed:", error);
+        }
+
+        if (this.isContactCache) {
+            // Purge cached client payload from previous transaction while retaining contact room availability for future linked sessions.
+            this.clientPayloadCache = null;
+            await this.ctx.storage.delete(DO_STATE_KEYS.CLIENT_PAYLOAD);
+            console.log("[caBLE] Resetting contact session state for reuse.");
+        } else {
+            // Tombstone symmetric QR-initiated session to prevent replay attacks.
+            this.isTombstonedCache = true;
+            await this.ctx.storage.put(DO_STATE_KEYS.TOMBSTONED, true);
+        }
+        
+        // 3. Explicitly cancel DO alarm to prevent leakages.
+        await this.ctx.storage.deleteAlarm();
+
+        console.log(`[caBLE] Session processing complete. ${this.isContactCache ? "Contact room reset and ready for next transaction." : "Durable Object instance permanently sealed."}`);
     }
 }

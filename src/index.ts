@@ -10,97 +10,97 @@ export { TunnelRoom };
 
 export default {
     /**
-     * Global Gateway Fetch Interceptor
-     * Maintains absolute statelessness, focusing entirely on protocol validation, security enforcement, and DO routing.
+     * Gateway Fetch Interceptor
+     * Stateless router focused on protocol validation, security checks, and Durable Objects routing.
      */
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-        // 1. Short-circuit evaluate CORS preflight requests
+        // 1. Fast path for CORS OPTIONS preflight request
         if (request.method === "OPTIONS") {
             return createOptionsResponse();
         }
 
-        // 2. HTTP Method constraints: WebSocket handshakes must use GET
+        // 2. HTTP method constraint: WebSocket upgrades must use GET requests
         if (request.method !== "GET") {
             return createError("Method Not Allowed", 405);
         }
 
-        // 3. Strict protocol compliance verification
+        // 3. Strict WebSocket upgrade headers validation
         const upgradeHeader = request.headers.get("Upgrade") || "";
-        if (upgradeHeader.toLowerCase() !== "websocket") {
+        const isWebSocketUpgrade = upgradeHeader.toLowerCase().split(",").map(s => s.trim()).includes("websocket");
+        if (!isWebSocketUpgrade) {
             return createError("Expected Upgrade: websocket", 426);
         }
 
         const protocols = request.headers.get("Sec-WebSocket-Protocol") || "";
-        if (!protocols.includes("fido.cable")) {
+        const hasFidoCable = protocols.split(",").map(p => p.trim()).includes("fido.cable");
+        if (!hasFidoCable) {
             return createError("Forbidden: Invalid WebSocket Protocol", 403);
         }
 
-        // Protocol validation: Require X-caBLE-Client-Payload to be hex-encoded,
-        // as specified for state-assisted transactions in CTAP 2.3 11.5.2.
-        // Implementation-defined security limit: Accept at most 64 decoded bytes
-        // (128 hexadecimal characters) to reduce resource-exhaustion risk.
-        const clientPayload = request.headers.get("X-caBLE-Client-Payload");
-        if (clientPayload !== null && !/^(?:[a-f0-9]{2}){1,64}$/i.test(clientPayload)) {
-            return createError("Bad Request: Invalid Client Payload encoding", 400);
-        }
-
-        // 4. Routing & endpoint evaluation
+        // 4. Endpoint and route analysis
         const url = new URL(request.url);
         const path = url.pathname;
         
-        const isCustom = path.startsWith("/cable/custom/");
+        // Enforce strict prefix matching because CTAP 2.3 requires pre-derived identifiers in all tunnel paths.
+        const isNew = path.startsWith("/cable/new/");
         const isConnect = path.startsWith("/cable/connect/");
         const isContact = path.startsWith("/cable/contact/"); 
 
-        if (!isCustom && !isConnect && !isContact) {
+        if (!isNew && !isConnect && !isContact) {
             return createError("Not Found: Invalid FIDO endpoint", 404);
         }
 
-        const parts = path.split("/").filter(Boolean);
-        if (parts.length < 3) {
-            return createError("Bad Request: Missing parameters", 400);
+        // Return 410 Gone on state-assisted transactions per CTAP 2.3 Section 11.5.2 so clients evict stale linking data and fall back to QR-initiated flows.
+        if (isContact) {
+            return createError("Gone: State-assisted transactions are not supported", 410);
         }
 
-        // Extract identifier strings (Tunnel ID or Contact ID)
+        const parts = path.split("/").filter(Boolean);
+
+        // Extract identifier (Tunnel ID)
         let identifier: string;
+
         if (isConnect) {
-            if (parts.length !== 4) return createError("Bad Request: Malformed connect URL", 400);
-            
-            // Security Enforcement: Pursuant to CTAP 2.3 spec, enforce 24-bit (6-char) lowercase Hex formatting on Routing IDs
+            // Require exactly 4 segments (/cable/connect/<routing_id>/<tunnel_id>) per CTAP 2.3 Section 11.5.1.1.1.
+            if (parts.length !== 4) {
+                return createError("Bad Request: Malformed connect URL", 400);
+            }
+
+            // Enforce 6-character lowercase hex format for routing ID.
             const routingId = parts[2];
             if (!/^[a-f0-9]{6}$/.test(routingId)) {
                 return createError("Bad Request: Invalid Routing ID format", 400);
             }
             
-            identifier = parts[3]; 
+            identifier = parts[3];
         } else {
-            identifier = parts[parts.length - 1];
+            // Enforce exactly 3 parts for "/cable/new/<tunnel_id>" pursuant to CTAP 2.3 strict path formatting constraints.
+            if (parts.length !== 3) {
+                return createError("Bad Request: Malformed URL path", 400);
+            }
+            identifier = parts[2];
         }
 
-        // 5. Structural identifier checks (defends against path traversal and malicious script injections)
+        // 5. Strict identifier format validation to defend against path traversal or injection.
         if (!validateIdentifier(identifier, isContact)) {
             return createError("Bad Request: Invalid Identifier format", 400);
         }
 
-        // 6. Routing Strategy: Generate a unique namespace key to map out the corresponding DO instances
-        const namespaceKey = isContact ? `contact:${identifier}` : `tunnel:${identifier}`;
+        // 6. Routing: Map request to a unique Durable Object instance.
+        const namespaceKey = `tunnel:${identifier}`;
         const doId = env.TUNNEL_ROOM.idFromName(namespaceKey);
 
-        // 7. Intelligent Retry & Request Forwarding
+        // 7. Forward request with exponential backoff retries.
         try {
-            // Wrap the DO invocation with the exponential backoff utility.
-            // Since GET requests contain no bodies, retrying avoids any "body already used" runtime TypeErrors.
-            return await withExponentialBackoff(() => {
-                // Cloudflare Durable Objects error handling:
-                // Acquire a new stub for each attempt because certain exceptions may leave
-                // the previous stub in a broken state and cause subsequent calls to fail.
+            // Return the Durable Object response directly to preserve WebSocket hibernation context.
+            return await withExponentialBackoff(async () => {
+                // Fetch a fresh stub on retry to prevent stale connection errors.
                 const stub = env.TUNNEL_ROOM.get(doId);
-                return stub.fetch(request);
+                return await stub.fetch(request);
             });
         } catch (error) {
             console.error(`Gateway failed to forward request to DO [${namespaceKey}]:`, error);
-            
-            // Mask underlying stack traces to avoid leaking infrastructural details
+            // Sanitize stack traces to avoid leaking internal system details.
             return createError("Service Unavailable: Tunnel creation failed", 503);
         }
     },

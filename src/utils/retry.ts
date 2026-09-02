@@ -26,8 +26,9 @@ export async function withExponentialBackoff<T>(
                 throw doError;
             }
             
-            // Rule 2: If the system explicitly marks the error as non-retryable, or retries are exhausted, abort.
-            if (doError.retryable === false || retries >= MAX_RETRIES) {
+            // Rule 2: Abort unless the runtime explicitly flags the error as retryable, or if retries are exhausted.
+            // Prevent retrying standard application exceptions where `retryable` is undefined.
+            if (!doError.retryable || retries >= MAX_RETRIES) {
                 throw doError;
             }
 

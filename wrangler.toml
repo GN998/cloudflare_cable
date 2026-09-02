@@ -1,6 +1,7 @@
 name = "cloudflare_cable"
 main = "src/index.ts"
-# Must be >= 2026-02-24 so that calling deleteAll() cleans up underlying Alarms automatically
+# Compatibility date for Durable Objects SQLite and newer runtime APIs.
+# Pending DO alarms must be deleted explicitly using deleteAlarm().
 compatibility_date = "2026-05-26"
 
 routes = [
@@ -19,15 +20,21 @@ new_sqlite_classes = ["TunnelRoom"]
 [observability]
 enabled = false
 head_sampling_rate = 0.1
+redact_query_string = false
 
 [observability.logs]
 enabled = true
-head_sampling_rate = 0.1
-persist = true
+head_sampling_rate = 1
 invocation_logs = true
-
-[placement]
-mode = "off"
+persist = true
 
 [observability.traces]
 enabled = true
+head_sampling_rate = 1
+persist = true
+
+[observability.issue_detection]
+enabled = false
+
+[vars]
+RECONNECT_GRACE_MS = "30000"
