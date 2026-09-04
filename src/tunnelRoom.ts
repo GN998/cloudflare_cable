@@ -14,8 +14,8 @@ export class TunnelRoom extends DurableObject<Env> {
         
         // Lock-free synchronous table creation:
         // DO storage operations are single-threaded and synchronous. We initialize schemas right inside the constructor.
-        // Spec Correction: Adhering strictly to official guidelines, blockConcurrencyWhile is used to block incoming 
-        // concurrent requests, ensuring the underlying Schema is fully initialized before routing any network traffic or events.
+        // Spec Correction: blockConcurrencyWhile is used to block incoming concurrent requests,
+        // ensuring the underlying Schema is fully initialized before routing any network traffic.
         this.ctx.blockConcurrencyWhile(async () => {
             this.ctx.storage.sql.exec(`
                 CREATE TABLE IF NOT EXISTS msg_buffer (
@@ -35,18 +35,17 @@ export class TunnelRoom extends DurableObject<Env> {
         const hasClientPayload = request.headers.has("X-caBLE-Client-Payload");
         const role = inferRole(url.pathname, hasClientPayload);
         const isContact = url.pathname.startsWith("/cable/contact/");
-        const isCustom = url.pathname.startsWith("/cable/custom/");
+        const isNew = url.pathname.startsWith("/cable/new/");
 
         // 2. Inspect tunnel lifecycle status (Tombstone mechanism)
-        // Use Synchronous KV API with boolean coercion to prevent undefined issues
-        if (!!this.ctx.storage.kv.get(DO_STATE_KEYS.TOMBSTONED)) {
+        const isTombstoned = !!(await this.ctx.storage.get(DO_STATE_KEYS.TOMBSTONED));
+        if (isTombstoned) {
             return createError("Gone: Tunnel is exhausted and permanently sealed", 410);
         }
 
         // 3. Record Contact status
         if (isContact) {
-            // Replace async put with Synchronous KV API to eliminate await and catch
-            this.ctx.storage.kv.put(DO_STATE_KEYS.IS_CONTACT, true);
+            await this.ctx.storage.put(DO_STATE_KEYS.IS_CONTACT, true);
         }
 
         // Core Mechanic: Exclusive eviction for identical roles & capacity restrictions
@@ -75,8 +74,7 @@ export class TunnelRoom extends DurableObject<Env> {
         const targetRole: Role = role === "client" ? "authenticator" : "client";
         const peerSockets = this.ctx.getWebSockets(targetRole);
         if (peerSockets.length > 0) {
-            // Replace async put with Synchronous KV API
-            this.ctx.storage.kv.put(DO_STATE_KEYS.HAS_PAIRED, true);
+            await this.ctx.storage.put(DO_STATE_KEYS.HAS_PAIRED, true);
         }
 
         // Implementation strategy: Atomically read and delete buffered peer messages
@@ -105,8 +103,6 @@ export class TunnelRoom extends DurableObject<Env> {
         });
 
         // Deliver buffered messages after the transaction commits.
-        // Delivery is best-effort: a send failure does not restore messages
-        // already removed from the persistent buffer.
         for (const msg of messagesToDispatch) {
             try {
                 server.send(msg);
@@ -118,12 +114,13 @@ export class TunnelRoom extends DurableObject<Env> {
         // 6. Assemble protocol response headers
         const headers = new Headers();
         const requestedProtocols = request.headers.get("Sec-WebSocket-Protocol") || "";
-        if (requestedProtocols.includes("fido.cable")) {
+        const protocolsList = requestedProtocols.split(",").map(p => p.trim());
+        if (protocolsList.includes("fido.cable")) {
             headers.set("Sec-WebSocket-Protocol", "fido.cable"); 
         }
 
         // If it is a newly customized creation request, supply a Routing ID to formulate the QR code
-        if (isCustom) {
+        if (isNew) {
             headers.set("X-Cable-Routing-Id", generateRoutingId());
         }
 
@@ -147,18 +144,14 @@ export class TunnelRoom extends DurableObject<Env> {
         }
 
         // Defensive Interception 3: Service-level DoS and memory-depletion protection.
-        // The illustrative implementation in CTAP 2.3 Section 11.5.1.2 rejects
-        // plaintext messages larger than 1 MiB (1,048,576 bytes).
-        // With the example's 32-byte padding granularity and a 16-byte AES-GCM tag,
-        // the resulting ciphertext can be up to 1,048,624 bytes.
-        // This service uses a conservative, implementation-defined limit of 1,049,600 bytes.
         if (message.byteLength > 1049600) {
             ws.close(1009, "Message Too Big: Exceeds service-defined ciphertext limit");
             return;
         }
 
         // Rapidly restore role context via tags
-        const myRole = this.ctx.getTags(ws)[0] as Role;
+        const tags = this.ctx.getTags(ws);
+        const myRole = (tags[0] || "client") as Role; 
         const targetRole: Role = myRole === "client" ? "authenticator" : "client";
         const peerSockets = this.ctx.getWebSockets(targetRole);
 
@@ -170,7 +163,6 @@ export class TunnelRoom extends DurableObject<Env> {
             }
         } else {
             // Peer is offline: synchronous buffer flush to disk
-            // Threshold protection (max 10 items) to prevent malicious SQLite storage flooding
             const countRow = this.ctx.storage.sql.exec(`SELECT count(*) as count FROM msg_buffer`).one();
             if ((countRow as any).count < 10) { 
                 this.ctx.storage.sql.exec(
@@ -208,15 +200,13 @@ export class TunnelRoom extends DurableObject<Env> {
         }
 
         // Schedule lifecycles via Alarms TTL
-        // Use Synchronous KV API with boolean coercion to prevent undefined issues
-        const isContact = !!this.ctx.storage.kv.get(DO_STATE_KEYS.IS_CONTACT);
-        const hasPaired = !!this.ctx.storage.kv.get(DO_STATE_KEYS.HAS_PAIRED);
-        const tombstoned = !!this.ctx.storage.kv.get(DO_STATE_KEYS.TOMBSTONED);
+        const isContact = !!(await this.ctx.storage.get(DO_STATE_KEYS.IS_CONTACT));
+        const hasPaired = !!(await this.ctx.storage.get(DO_STATE_KEYS.HAS_PAIRED));
+        const tombstoned = !!(await this.ctx.storage.get(DO_STATE_KEYS.TOMBSTONED));
         
         if (!isContact && hasPaired && !tombstoned) {
             // Ephemeral session already paired: Mark as dead, queue physical purge in 1 minute
-            // Replace async put with Synchronous KV API
-            this.ctx.storage.kv.put(DO_STATE_KEYS.TOMBSTONED, true);
+            await this.ctx.storage.put(DO_STATE_KEYS.TOMBSTONED, true);
             await this.ctx.storage.setAlarm(Date.now() + 60 * 1000); 
         } else if (isContact) {
             // Persistent contact: Silently extend lease for 30 days
@@ -229,8 +219,6 @@ export class TunnelRoom extends DurableObject<Env> {
 
     /**
      * Core Mechanic: Absolute Physical Destruction
-     * When the alarm fires, utilizing compatibility features >= 2026-02-24,
-     * deleteAll() clears SQLite tables, KV properties, and pending alarms atomically.
      */
     async alarm() {
         const allSockets = this.ctx.getWebSockets();

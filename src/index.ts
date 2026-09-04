@@ -26,34 +26,41 @@ export default {
 
         // 3. Strict protocol compliance verification
         const upgradeHeader = request.headers.get("Upgrade") || "";
-        if (upgradeHeader.toLowerCase() !== "websocket") {
+        // Compatible with multi-valued upgrade headers (e.g., "keep-alive, Upgrade")
+        const isWebSocketUpgrade = upgradeHeader.toLowerCase().split(",").map(s => s.trim()).includes("websocket");
+        if (!isWebSocketUpgrade) {
             return createError("Expected Upgrade: websocket", 426);
         }
 
         const protocols = request.headers.get("Sec-WebSocket-Protocol") || "";
-        if (!protocols.includes("fido.cable")) {
+        // Parse comma-separated protocols robustly
+        const hasFidoCable = protocols.split(",").map(p => p.trim()).includes("fido.cable");
+        if (!hasFidoCable) {
             return createError("Forbidden: Invalid WebSocket Protocol", 403);
-        }
-
-        // Protocol validation: Require X-caBLE-Client-Payload to be hex-encoded,
-        // as specified for state-assisted transactions in CTAP 2.3 11.5.2.
-        // Implementation-defined security limit: Accept at most 64 decoded bytes
-        // (128 hexadecimal characters) to reduce resource-exhaustion risk.
-        const clientPayload = request.headers.get("X-caBLE-Client-Payload");
-        if (clientPayload !== null && !/^(?:[a-f0-9]{2}){1,64}$/i.test(clientPayload)) {
-            return createError("Bad Request: Invalid Client Payload encoding", 400);
         }
 
         // 4. Routing & endpoint evaluation
         const url = new URL(request.url);
         const path = url.pathname;
         
-        const isCustom = path.startsWith("/cable/custom/");
+        // Exclusively support '/cable/new/' as the registration/creation endpoint (abandoned /cable/custom/)
+        const isNew = path.startsWith("/cable/new/");
         const isConnect = path.startsWith("/cable/connect/");
         const isContact = path.startsWith("/cable/contact/"); 
 
-        if (!isCustom && !isConnect && !isContact) {
+        if (!isNew && !isConnect && !isContact) {
             return createError("Not Found: Invalid FIDO endpoint", 404);
+        }
+
+        // Protocol validation: Require X-caBLE-Client-Payload for state-assisted transactions (CTAP 2.3 11.5.2)
+        const clientPayload = request.headers.get("X-caBLE-Client-Payload");
+        if (isContact && clientPayload === null) {
+            return createError("Bad Request: Missing X-caBLE-Client-Payload header for state-assisted transaction", 400);
+        }
+
+        // Implementation-defined security limit: Accept at most 64 decoded bytes (128 hex characters)
+        if (clientPayload !== null && !/^(?:[a-f0-9]{2}){1,64}$/i.test(clientPayload)) {
+            return createError("Bad Request: Invalid Client Payload encoding", 400);
         }
 
         const parts = path.split("/").filter(Boolean);
@@ -72,7 +79,7 @@ export default {
                 return createError("Bad Request: Invalid Routing ID format", 400);
             }
             
-            identifier = parts[3]; 
+            identifier = parts[3];
         } else {
             identifier = parts[parts.length - 1];
         }
@@ -88,12 +95,9 @@ export default {
 
         // 7. Intelligent Retry & Request Forwarding
         try {
-            // Wrap the DO invocation with the exponential backoff utility.
-            // Since GET requests contain no bodies, retrying avoids any "body already used" runtime TypeErrors.
             return await withExponentialBackoff(() => {
                 // Cloudflare Durable Objects error handling:
-                // Acquire a new stub for each attempt because certain exceptions may leave
-                // the previous stub in a broken state and cause subsequent calls to fail.
+                // Acquire a new stub for each attempt to avoid broken stub state issues.
                 const stub = env.TUNNEL_ROOM.get(doId);
                 return stub.fetch(request);
             });
