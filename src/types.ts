@@ -70,7 +70,12 @@ export const DB_CONFIG = {
     /**
      * Enforce absolute session lifetime (in milliseconds) to accommodate user verification and the 2-minute post-shutdown window required by CTAP 2.3.
      */
-    SESSION_TTL_MS: 240000,
+    SESSION_TTL_MS: 121000,
+
+    /**
+     * Retain tombstone state for 5 minutes to block delayed replay attempts before purging storage for Durable Object garbage collection.
+     */
+    TOMBSTONE_TTL_MS: 181000,
 } as const;
 
 /**

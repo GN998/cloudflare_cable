@@ -28,7 +28,11 @@ export class TunnelRoom extends DurableObject<Env> {
         // Use blockConcurrencyWhile for asynchronous schema initialization, blocking concurrent requests.
         this.ctx.blockConcurrencyWhile(async () => {
             try {
-                this.db.initSchema();
+                // Skip schema creation when waking a tombstoned instance for final eviction to avoid billed SQLite page writes.
+                this.isTombstonedCache = !!(await this.ctx.storage.get(DO_STATE_KEYS.TOMBSTONED));
+                if (!this.isTombstonedCache) {
+                    this.db.initSchema();
+                }
             } catch (error) {
                 console.error("[caBLE] Failed to initialize SQLite database:", error);
             }
@@ -261,9 +265,16 @@ export class TunnelRoom extends DurableObject<Env> {
     }
 
     /**
-     * Execute tunnel teardown when reconnect grace period, disconnect timer, or session TTL expires.
+     * Execute tunnel teardown or final storage eviction when lifecycle alarm expires.
      */
     async alarm() {
+        // Purge all persistent storage once the tombstone anti-replay window expires so Cloudflare garbage-collects the instance.
+        if (this.isTombstonedCache) {
+            console.log(`[caBLE] Tombstone TTL expired. Purging all storage to release SQLite allocation.`);
+            await this.ctx.storage.deleteAll();
+            return;
+        }
+
         console.log(`[caBLE] Lifecycle alarm triggered. Sealing tunnel room.`);
         await this.sealTunnel();
     }
@@ -295,16 +306,14 @@ export class TunnelRoom extends DurableObject<Env> {
             // Purge cached client payload from previous transaction while retaining contact room availability for future linked sessions.
             this.clientPayloadCache = null;
             await this.ctx.storage.delete(DO_STATE_KEYS.CLIENT_PAYLOAD);
+            await this.ctx.storage.deleteAlarm();
             console.log("[caBLE] Resetting contact session state for reuse.");
         } else {
-            // Tombstone symmetric QR-initiated session to prevent replay attacks.
+            // Tombstone symmetric QR-initiated session to prevent replay attacks, then schedule final storage eviction.
             this.isTombstonedCache = true;
             await this.ctx.storage.put(DO_STATE_KEYS.TOMBSTONED, true);
+            await this.ctx.storage.setAlarm(Date.now() + DB_CONFIG.TOMBSTONE_TTL_MS);
+            console.log("[caBLE] Durable Object instance sealed. Scheduled storage eviction in 3m.");
         }
-        
-        // 3. Explicitly cancel DO alarm to prevent leakages.
-        await this.ctx.storage.deleteAlarm();
-
-        console.log(`[caBLE] Session processing complete. ${this.isContactCache ? "Contact room reset and ready for next transaction." : "Durable Object instance permanently sealed."}`);
     }
 }
